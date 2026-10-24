@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AIFS vs NBM Verification Dashboard</title>
+    <title>AIFS vs NBM Temperature Verification</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         .map-img { width: 100%; max-width: 1050px; height: auto; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
@@ -13,20 +13,21 @@
 <div class="container py-4">
     <header class="pb-3 mb-4 border-bottom text-center">
         <h1 class="fw-bold">AIFS vs. NBM Medium-Range Temperature Verification</h1>
-        <p class="text-muted">Evaluating ECMWF AIFS against NBM 06z QMD relative to NOAA URMA Analysis</p>
+        <p class="text-muted">Apples-to-Apples Synoptic Hourly Evaluation vs. NOAA URMA Analysis</p>
     </header>
 
-    <!-- Operational Disclaimer -->
-    <div class="alert alert-warning" role="alert">
-        <h5 class="alert-heading fw-bold">⚠️ Methodological Notes & Proxies:</h5>
+    <!-- Methodology Disclaimer -->
+    <div class="alert alert-info" role="alert">
+        <h5 class="alert-heading fw-bold">ℹ️ Apples-to-Apples Verification Methodology:</h5>
+        <p class="mb-2">Because the AIFS Open Data ensemble delivers 6-hourly outputs, comparing it against continuous 24-hour daily extremes creates artificial bias. To ensure an objective evaluation, <strong>AIFS, NBM, and URMA are sampled at the exact same hourly timestamps:</strong></p>
         <ul class="mb-0">
-            <li><strong>Not a True AIFS Max/Min:</strong> Because the AIFS Open Data ensemble provides 6-hourly steps, <strong>12z is used as the proxy for Min T</strong>, and the <strong>higher of 18z and 00z is used as the proxy for Max T</strong>.</li>
-            <li><strong>Ensemble Mean vs. Median:</strong> AIFS represents the native 0.25° <strong>Ensemble Mean</strong>. NBM represents the 06z cycle QMD <strong>50th percentile (Median)</strong>, which is delivered operationally as the <strong>13z NBM</strong> package.</li>
-            <li><strong>Truth Baseline:</strong> Verifications are calculated against the NOAA 2.5km URMA daily analyses regridded to an identical 0.25° CONUS mesh.</li>
+            <li><strong>Minimum Temperature Proxy:</strong> Evaluated directly at <strong>12:00 UTC</strong> across AIFS, NBM, and URMA.</li>
+            <li><strong>Maximum Temperature Proxy:</strong> Evaluated as <strong>$\max(18\text{z}, 00\text{z})$</strong> across AIFS, NBM, and URMA.</li>
+            <li><strong>Cycles:</strong> 00z AIFS Ensemble Mean vs. 06z NBM Core (13z operational package) on a shared 0.25° CONUS mesh.</li>
         </ul>
     </div>
 
-    <!-- Interactive Switcher -->
+    <!-- Controls -->
     <div class="card p-3 my-4">
         <div class="row g-3 align-items-center justify-content-center">
             <div class="col-auto">
@@ -45,8 +46,8 @@
             <div class="col-auto">
                 <label class="fw-bold">Variable:</label>
                 <select id="varSelect" class="form-select" onchange="updateView()">
-                    <option value="maxt" selected>Maximum Temperature</option>
-                    <option value="mint">Minimum Temperature</option>
+                    <option value="maxt" selected>Max T Proxy [max(18z, 00z)]</option>
+                    <option value="mint">Min T Proxy [12z]</option>
                 </select>
             </div>
             <div class="col-auto">
@@ -59,19 +60,21 @@
         </div>
     </div>
 
+    <!-- Map Display -->
     <div class="text-center mb-5">
         <img id="displayMap" class="map-img border" src="assets/maps/day3_maxt_bias.png" alt="Verification Map">
     </div>
 
+    <!-- CONUS Trend Charts -->
     <div class="card p-4">
         <h4 class="fw-bold border-bottom pb-2">CONUS Error Trends (Days 1–8)</h4>
         <div class="row mt-3">
             <div class="col-md-6 text-center">
-                <h6>Maximum Temperature MAE</h6>
+                <h6>Max T Proxy [max(18z, 00z)] MAE</h6>
                 <img class="img-fluid border rounded" src="assets/charts/regional_mae_conus_maxt.png" alt="Max T Error Trend">
             </div>
             <div class="col-md-6 text-center">
-                <h6>Minimum Temperature MAE</h6>
+                <h6>Min T Proxy [12z] MAE</h6>
                 <img class="img-fluid border rounded" src="assets/charts/regional_mae_conus_mint.png" alt="Min T Error Trend">
             </div>
         </div>
