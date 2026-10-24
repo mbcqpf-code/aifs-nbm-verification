@@ -9,7 +9,6 @@ import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 import warnings
 
-# Suppress benign RuntimeWarnings for all-NaN ocean grid slices
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 MAP_DIR = "docs/assets/maps"
@@ -22,7 +21,7 @@ if not files:
     raise FileNotFoundError("No cache files found in data_cache/")
 
 # ------------------------------------------------------------------------------
-# 1. Spatial Map Generator (Side-by-Side AIFS vs NBM)
+# 1. Spatial Bias & MAE Maps (Side-by-Side Comparison)
 # ------------------------------------------------------------------------------
 def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_label, metric, out_name):
     if metric == 'bias':
@@ -31,7 +30,7 @@ def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, v
         cmap = 'bwr'
         vmin, vmax = -10, 10
         metric_label = "Mean Bias (°F)"
-    else: # MAE
+    else:  # mae
         grid_aifs = np.nanmean(np.abs(diff_stack_aifs), axis=0)
         grid_nbm = np.nanmean(np.abs(diff_stack_nbm), axis=0)
         cmap = 'YlOrRd'
@@ -40,7 +39,7 @@ def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, v
 
     fig, axs = plt.subplots(1, 2, figsize=(16, 6), subplot_kw={'projection': ccrs.PlateCarree()})
     
-    for ax, data, model_title in zip(axs, [grid_aifs, grid_nbm], ["AIFS Ensemble Mean (Proxy)", "NBM 06z (13z Operational)"]):
+    for ax, data, model_title in zip(axs, [grid_aifs, grid_nbm], ["AIFS Ensemble Mean (Proxy)", "NBM 06z Core (13z Op)"]):
         ax.set_extent([-125, -66, 24, 50], crs=ccrs.PlateCarree())
         ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.6)
         ax.add_feature(cfeature.STATES.with_scale('50m'), linewidth=0.3, edgecolor='gray')
@@ -50,64 +49,135 @@ def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, v
     fig.subplots_adjust(bottom=0.15)
     cbar_ax = fig.add_axes([0.25, 0.08, 0.5, 0.03])
     cbar = fig.colorbar(im, cax=cbar_ax, orientation='horizontal')
-    cbar.set_label(f"Difference vs URMA (°F) [Window N={len(diff_stack_aifs)}]", fontsize=11)
+    cbar.set_label(f"Difference vs URMA (°F) [Window N={len(diff_stack_aifs)} Days]", fontsize=11)
     
     plt.savefig(os.path.join(MAP_DIR, out_name), dpi=130, bbox_inches='tight')
     plt.close()
 
 # ------------------------------------------------------------------------------
-# 2. Regional Summary Line Charts (Dask-free sequential loading)
+# 2. Win Rate Map (% of Days AIFS Error < NBM Error)
+# ------------------------------------------------------------------------------
+def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_label, out_name):
+    aifs_abs = np.abs(diff_stack_aifs)
+    nbm_abs = np.abs(diff_stack_nbm)
+
+    valid_mask = (~np.isnan(aifs_abs)) & (~np.isnan(nbm_abs))
+    aifs_wins = (aifs_abs < nbm_abs) & valid_mask
+
+    n_valid = np.sum(valid_mask, axis=0)
+    n_wins = np.sum(aifs_wins, axis=0)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        win_rate = np.where(n_valid > 0, (n_wins / n_valid) * 100.0, np.nan)
+
+    fig = plt.figure(figsize=(11, 7))
+    ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    ax.set_extent([-125, -66, 24, 50], crs=ccrs.PlateCarree())
+    ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.7)
+    ax.add_feature(cfeature.STATES.with_scale('50m'), linewidth=0.4, edgecolor='gray')
+
+    # Diverging: Red (<50%, NBM Better), Blue (>50%, AIFS Better), White (50%, Tie)
+    levels = np.arange(0, 105, 5)
+    im = ax.contourf(
+        lons, lats, win_rate, 
+        levels=levels, 
+        cmap='RdBu', 
+        vmin=0, 
+        vmax=100, 
+        transform=ccrs.PlateCarree(),
+        extend='neither'
+    )
+
+    ax.set_title(
+        f"AIFS vs. NBM Win Rate: % of Days AIFS Absolute Error < NBM Absolute Error\n"
+        f"Day {lead} {var_label} [Sample Window N={len(diff_stack_aifs)} Days]",
+        fontsize=12, weight='bold', pad=10
+    )
+
+    cbar = plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.06, shrink=0.7, ticks=[0, 20, 35, 50, 65, 80, 100])
+    cbar.ax.set_xticklabels(['0% (100% NBM)', '20%', '35%', '50% (Tie)', '65%', '80%', '100% (100% AIFS)'])
+    cbar.set_label("Blue = AIFS More Accurate | Red = NBM More Accurate", fontsize=10, weight='bold')
+
+    plt.savefig(os.path.join(MAP_DIR, out_name), dpi=130, bbox_inches='tight')
+    plt.close()
+
+# ------------------------------------------------------------------------------
+# 3. Regional Line Charts (CONUS vs. East of Rockies)
 # ------------------------------------------------------------------------------
 def generate_regional_charts(window_files):
     leads = list(range(1, 9))
-    
-    # Open datasets individually without needing Dask
     datasets = [xr.open_dataset(f) for f in window_files]
     
     try:
-        for var in ['maxt', 'mint']:
-            var_name = "Max Temp" if var == 'maxt' else "Min Temp"
-            plt.figure(figsize=(10, 5))
-            
-            aifs_mae = []
-            nbm_mae = []
-            
-            for l in leads:
-                a_stack = [ds[f'aifs_lead_{l}_{var}_diff'].values for ds in datasets if f'aifs_lead_{l}_{var}_diff' in ds]
-                n_stack = [ds[f'nbm_lead_{l}_{var}_diff'].values for ds in datasets if f'nbm_lead_{l}_{var}_diff' in ds]
-                
-                aifs_val = np.nanmean(np.abs(np.array(a_stack))) if a_stack else np.nan
-                nbm_val = np.nanmean(np.abs(np.array(n_stack))) if n_stack else np.nan
-                
-                aifs_mae.append(aifs_val)
-                nbm_mae.append(nbm_val)
+        sample_ds = datasets[0]
+        lats = sample_ds.lat.values
+        lons = sample_ds.lon.values
+        mesh_lons, _ = np.meshgrid(lons, lats)
+        
+        # East of Rockies Mask: Longitude >= -105.0°W
+        east_mask = (mesh_lons >= -105.0)
 
-            plt.plot(leads, aifs_mae, marker='o', linewidth=2, color='#1f77b4', label='AIFS Proxy (Ens Mean)')
-            plt.plot(leads, nbm_mae, marker='s', linewidth=2, color='#ff7f0e', label='NBM QMD (13z Median)')
+        domains = [
+            ("CONUS", "conus", None),
+            ("East of Rockies (Lon >= -105°W)", "east_rockies", east_mask)
+        ]
 
-            plt.title(f"CONUS Average MAE vs Lead Time: {var_name} (Last {len(window_files)} Days)", fontsize=13, weight='bold')
-            plt.xlabel("Forecast Lead Day", fontsize=11)
-            plt.ylabel("Mean Absolute Error (°F)", fontsize=11)
-            plt.grid(True, linestyle='--', alpha=0.5)
-            plt.legend(fontsize=11)
-            plt.xticks(leads)
-            
-            plt.savefig(os.path.join(CHART_DIR, f"regional_mae_conus_{var}.png"), dpi=130, bbox_inches='tight')
-            plt.close()
+        for domain_name, domain_slug, mask in domains:
+            for var in ['maxt', 'mint']:
+                var_name = "Max Temp Proxy [max(18z, 00z)]" if var == 'maxt' else "Min Temp Proxy [12z]"
+                plt.figure(figsize=(10, 5))
+                
+                aifs_mae = []
+                nbm_mae = []
+                
+                for l in leads:
+                    a_stack = [ds[f'aifs_lead_{l}_{var}_diff'].values for ds in datasets if f'aifs_lead_{l}_{var}_diff' in ds]
+                    n_stack = [ds[f'nbm_lead_{l}_{var}_diff'].values for ds in datasets if f'nbm_lead_{l}_{var}_diff' in ds]
+                    
+                    if a_stack and n_stack:
+                        a_arr = np.array(a_stack)
+                        n_arr = np.array(n_stack)
+                        
+                        if mask is not None:
+                            # Slice grid cells falling in the domain
+                            a_val = np.nanmean(np.abs(a_arr[:, mask]))
+                            n_val = np.nanmean(np.abs(n_arr[:, mask]))
+                        else:
+                            a_val = np.nanmean(np.abs(a_arr))
+                            n_val = np.nanmean(np.abs(n_arr))
+                    else:
+                        a_val, n_val = np.nan, np.nan
+                    
+                    aifs_mae.append(a_val)
+                    nbm_mae.append(n_val)
+
+                plt.plot(leads, aifs_mae, marker='o', linewidth=2, color='#1f77b4', label='AIFS Proxy (Ens Mean)')
+                plt.plot(leads, nbm_mae, marker='s', linewidth=2, color='#ff7f0e', label='NBM Core (13z Op)')
+
+                plt.title(f"{domain_name} MAE vs Lead Time: {var_name}\nEvaluated Against URMA (Last {len(window_files)} Days)", fontsize=12, weight='bold')
+                plt.xlabel("Forecast Lead Day", fontsize=11)
+                plt.ylabel("Mean Absolute Error (°F)", fontsize=11)
+                plt.grid(True, linestyle='--', alpha=0.5)
+                plt.legend(fontsize=11)
+                plt.xticks(leads)
+                
+                out_chart_name = f"regional_mae_{domain_slug}_{var}.png"
+                plt.savefig(os.path.join(CHART_DIR, out_chart_name), dpi=130, bbox_inches='tight')
+                plt.close()
     finally:
         for ds in datasets:
             ds.close()
 
 # ------------------------------------------------------------------------------
-# 3. Main Plotting Execution
+# 4. Main Execution
 # ------------------------------------------------------------------------------
-window_files = files[:min(7, len(files))]
+window_files = files[:min(14, len(files))]
 with xr.open_dataset(files[0]) as ref:
     lats = ref.lat.values
     lons = ref.lon.values
 
 for lead in range(1, 9):
-    for var, var_label in [('maxt', 'Max T'), ('mint', 'Min T')]:
+    for var, var_label in [('maxt', 'Max T Proxy'), ('mint', 'Min T Proxy')]:
         aifs_diffs = []
         nbm_diffs = []
         for f in window_files:
@@ -123,6 +193,7 @@ for lead in range(1, 9):
         if not aifs_diffs or not nbm_diffs:
             continue
 
+        # Generate Bias and MAE side-by-side maps
         for metric in ['bias', 'mae']:
             out_filename = f"day{lead}_{var}_{metric}.png"
             plot_spatial_comparison(
@@ -130,5 +201,12 @@ for lead in range(1, 9):
                 lead, var_label, metric, out_filename
             )
 
+        # Generate Win Rate superiority map
+        winrate_filename = f"day{lead}_{var}_winrate.png"
+        plot_winrate_map(
+            np.array(aifs_diffs), np.array(nbm_diffs), lats, lons,
+            lead, var_label, winrate_filename
+        )
+
 generate_regional_charts(window_files)
-print("Maps and charts successfully generated.")
+print("Plots and regional charts successfully generated.")
