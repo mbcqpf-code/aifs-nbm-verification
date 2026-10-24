@@ -1,0 +1,71 @@
+name: Daily Model Verification Tracker
+
+on:
+  schedule:
+    - cron: '0 14 * * *' # 14:00 UTC daily (post-NBM 13z operational release)
+  workflow_dispatch:
+    inputs:
+      backfill_days:
+        description: 'Number of historical days to backfill'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  verify-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install System Libraries for Cartopy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgeos-dev libproj-dev libeccodes0
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Ingestion & Verification
+        run: |
+          DAYS="${{ github.event.inputs.backfill_days || '1' }}"
+          python scripts/daily_verification.py --backfill $DAYS
+
+      - name: Generate Maps and Regional Trend Charts
+        run: |
+          python scripts/generate_plots.py
+
+      - name: Commit Updated Cache and Plots
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data_cache/*.nc docs/assets/
+          git commit -m "Auto-update verification database and charts [skip ci]" || echo "No changes to commit"
+          git push
+
+      - name: Upload GitHub Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'docs/'
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
