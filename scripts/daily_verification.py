@@ -1,5 +1,6 @@
 import os
 import glob
+import time
 import argparse
 import requests
 import tempfile
@@ -14,7 +15,17 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ------------------------------------------------------------------------------
-# 1. Target Grid Setup (0.25° CONUS Mesh)
+# 1. Neutralize multiurl's 120-Second Retry Sleep
+# ------------------------------------------------------------------------------
+try:
+    import multiurl.http
+    # Override the default 120-second wait down to 5 seconds with 5 max tries
+    multiurl.http.ROBUST_DEFAULTS = {"maximum_tries": 5, "retry_after": 5}
+except Exception:
+    pass
+
+# ------------------------------------------------------------------------------
+# 2. Target Grid Setup (0.25° CONUS Mesh)
 # ------------------------------------------------------------------------------
 LAT_MIN, LAT_MAX = 24.0, 50.0
 LON_MIN, LON_MAX = -125.0, -65.0
@@ -25,9 +36,6 @@ TARGET_LONS, TARGET_LATS = np.meshgrid(grid_lons, grid_lats)
 CACHE_DIR = "data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# ------------------------------------------------------------------------------
-# 2. Curvilinear Regridder (For NBM and URMA)
-# ------------------------------------------------------------------------------
 def regrid_to_conus(data, lats, lons):
     if lons.max() > 180:
         lons = np.where(lons > 180, lons - 360, lons)
@@ -40,27 +48,30 @@ def regrid_to_conus(data, lats, lons):
     )
 
 # ------------------------------------------------------------------------------
-# 3. Direct AIFS Ensemble Mean Retrieval (type="em")
+# 3. Batched AIFS Retrieval (1 Call Instead of 3)
 # ------------------------------------------------------------------------------
-def get_aifs_em_t2m(init_date_str, fxx):
+def get_aifs_proxies(init_date_str, lead_day):
     """
-    Retrieves the native AIFS Ensemble Mean (type="em") 2m temperature directly.
-    Tries Azure (full archive) first, then AWS, then ECMWF open data.
+    Downloads Min T (12z) and Max T (18z & 00z) in a SINGLE batched GRIB transfer.
     """
-    # init_date_str is YYYY-MM-DD
     dt_clean = init_date_str.replace("-", "")
-    
+    fxx_min = lead_day * 24 - 12
+    fxx_max1 = lead_day * 24 - 6
+    fxx_max2 = lead_day * 24
+    needed_steps = [fxx_min, fxx_max1, fxx_max2]
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".grib2") as tmp:
         tmp_target = tmp.name
 
     success = False
+    # Cycle sources: Azure usually throttles less than AWS S3 on date prefixes
     for source in ["azure", "aws", "ecmwf"]:
         try:
             client = Client(source=source, model="aifs-ens", resol="0p25")
             client.retrieve(
                 date=dt_clean,
                 time=0,
-                step=fxx,
+                step=needed_steps,
                 stream="enfo",
                 type="em",
                 levtype="sfc",
@@ -74,37 +85,34 @@ def get_aifs_em_t2m(init_date_str, fxx):
 
     if not success:
         if os.path.exists(tmp_target): os.remove(tmp_target)
-        raise RuntimeError(f"Could not retrieve AIFS ENS mean for date={dt_clean} step={fxx}")
+        raise RuntimeError(f"Could not retrieve AIFS ENS steps {needed_steps} for {dt_clean}")
 
-    ds = xr.open_dataset(tmp_target, engine='cfgrib')
+    # Read the multi-step GRIB
+    ds = xr.open_dataset(tmp_target, engine='cfgrib', backend_kwargs={'indexpath': ''})
     var_key = 't2m' if 't2m' in ds else list(ds.data_vars)[0]
-    field = ds[var_key]
+    da = ds[var_key]
 
-    if field.longitude.max() > 180:
-        field = field.assign_coords(longitude=(((field.longitude + 180) % 360) - 180))
-    field = field.sortby(['latitude', 'longitude'])
+    if da.longitude.max() > 180:
+        da = da.assign_coords(longitude=(((da.longitude + 180) % 360) - 180))
+    da = da.sortby(['latitude', 'longitude'])
+    da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
 
-    field_interp = field.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
-    t2m_k = field_interp.squeeze().values
-    
+    # Extract grids by step index
+    # (Step 0 = fxx_min, Step 1 = fxx_max1, Step 2 = fxx_max2)
+    vals = da_interp.values
     ds.close()
-    for f in glob.glob(f"{tmp_target}*"): 
+    for f in glob.glob(f"{tmp_target}*"):
         try: os.remove(f)
         except Exception: pass
-        
-    return t2m_k
 
-def get_aifs_proxies(init_date_str, lead_day):
-    """Min T = 12z proxy; Max T = max(18z, 00z) proxy."""
-    fxx_min = lead_day * 24 - 12
-    fxx_max1 = lead_day * 24 - 6
-    fxx_max2 = lead_day * 24
+    if vals.ndim == 3:
+        t_min_k = vals[0]
+        t_max_k = np.maximum(vals[1], vals[2])
+    else:
+        # Fallback if single slice returned
+        t_min_k = vals
+        t_max_k = vals
 
-    t_min_k = get_aifs_em_t2m(init_date_str, fxx_min)
-    t_max1_k = get_aifs_em_t2m(init_date_str, fxx_max1)
-    t_max2_k = get_aifs_em_t2m(init_date_str, fxx_max2)
-
-    t_max_k = np.maximum(t_max1_k, t_max2_k)
     return (t_min_k - 273.15) * 9/5 + 32, (t_max_k - 273.15) * 9/5 + 32
 
 # ------------------------------------------------------------------------------
@@ -144,13 +152,13 @@ def get_nbm_qmd(init_dt, lead_hrs, var_type):
         tmp.write(r.content)
         tmp_path = tmp.name
         
-    ds = xr.open_dataset(tmp_path, engine='cfgrib')
+    ds = xr.open_dataset(tmp_path, engine='cfgrib', backend_kwargs={'indexpath': ''})
     var_name = list(ds.data_vars)[0]
     data = ds[var_name].values
     lats = ds.latitude.values
     lons = ds.longitude.values
     ds.close()
-    for f in glob.glob(f"{tmp_path}*"): 
+    for f in glob.glob(f"{tmp_path}*"):
         try: os.remove(f)
         except Exception: pass
     
@@ -159,25 +167,25 @@ def get_nbm_qmd(init_dt, lead_hrs, var_type):
 
 def get_urma(valid_date_str):
     H_max = Herbie(f"{valid_date_str} 08:00", model="urma", product="anl")
-    ds_max = H_max.xarray(":TMAX:2 m above ground:")
+    ds_max = H_max.xarray(":TMAX:2 m above ground:", remove_grib=True)
     t_max_data = ds_max[list(ds_max.data_vars)[0]].squeeze().values[::2, ::2]
     t_max = regrid_to_conus(t_max_data, ds_max.latitude.values[::2, ::2], ds_max.longitude.values[::2, ::2])
 
     H_min = Herbie(f"{valid_date_str} 20:00", model="urma", product="anl")
-    ds_min = H_min.xarray(":TMIN:2 m above ground:")
+    ds_min = H_min.xarray(":TMIN:2 m above ground:", remove_grib=True)
     t_min_data = ds_min[list(ds_min.data_vars)[0]].squeeze().values[::2, ::2]
     t_min = regrid_to_conus(t_min_data, ds_min.latitude.values[::2, ::2], ds_min.longitude.values[::2, ::2])
 
     return (t_min - 273.15) * 9/5 + 32, (t_max - 273.15) * 9/5 + 32
 
 # ------------------------------------------------------------------------------
-# 5. Daily Processing Loop
+# 5. Main Processing Loop
 # ------------------------------------------------------------------------------
 def process_date(target_dt):
     date_str = target_dt.strftime('%Y-%m-%d')
     nc_path = os.path.join(CACHE_DIR, f"diff_{date_str}.nc")
     if os.path.exists(nc_path):
-        print(f"[{date_str}] Already exists. Skipping.")
+        print(f"[{date_str}] Cache exists. Skipping.")
         return
 
     print(f"\n--- Processing Valid Date: {date_str} ---")
@@ -193,16 +201,19 @@ def process_date(target_dt):
         init_date_str = init_date.strftime('%Y-%m-%d')
         init_06z = pd.to_datetime(f"{init_date_str} 06:00")
         
-        # AIFS Direct Mean
+        # AIFS Batched Proxy
         try:
             aifs_min, aifs_max = get_aifs_proxies(init_date_str, lead)
             daily_diffs[f'aifs_lead_{lead}_maxt_diff'] = (['lat', 'lon'], (aifs_max - urma_max_f).astype(np.float32))
             daily_diffs[f'aifs_lead_{lead}_mint_diff'] = (['lat', 'lon'], (aifs_min - urma_min_f).astype(np.float32))
-            print(f"  -> Day {lead} AIFS (Direct Mean) processed.")
+            print(f"  -> Day {lead} AIFS (Batched) processed.")
         except Exception as e:
             print(f"  [!] AIFS Day {lead} failed: {e}")
             daily_diffs[f'aifs_lead_{lead}_maxt_diff'] = (['lat', 'lon'], np.full(TARGET_LATS.shape, np.nan, dtype=np.float32))
             daily_diffs[f'aifs_lead_{lead}_mint_diff'] = (['lat', 'lon'], np.full(TARGET_LATS.shape, np.nan, dtype=np.float32))
+
+        # Polite 1.5s delay to keep AWS/Azure rate limiters happy
+        time.sleep(1.5)
 
         # NBM QMD Median
         try:
