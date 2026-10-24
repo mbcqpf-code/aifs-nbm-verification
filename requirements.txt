@@ -1,0 +1,11 @@
+herbie-data>=2024.1.0
+eccodes
+cfgrib
+xarray
+netcdf4
+scipy
+pandas
+numpy
+matplotlib
+cartopy
+requests
