@@ -15,17 +15,16 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ------------------------------------------------------------------------------
-# 1. Neutralize multiurl's 120-Second Retry Sleep
+# 1. Neutralize multiurl 120s Sleep
 # ------------------------------------------------------------------------------
 try:
     import multiurl.http
-    # Override the default 120-second wait down to 5 seconds with 5 max tries
     multiurl.http.ROBUST_DEFAULTS = {"maximum_tries": 5, "retry_after": 5}
 except Exception:
     pass
 
 # ------------------------------------------------------------------------------
-# 2. Target Grid Setup (0.25° CONUS Mesh)
+# 2. Target 0.25° CONUS Grid
 # ------------------------------------------------------------------------------
 LAT_MIN, LAT_MAX = 24.0, 50.0
 LON_MIN, LON_MAX = -125.0, -65.0
@@ -48,23 +47,50 @@ def regrid_to_conus(data, lats, lons):
     )
 
 # ------------------------------------------------------------------------------
-# 3. Batched AIFS Retrieval (1 Call Instead of 3)
+# 3. URMA Hourly 2m Temperatures (12z, 18z, 00z)
+# ------------------------------------------------------------------------------
+def get_urma_tmp(dt_str):
+    """Pulls URMA instantaneous 2m temperature analysis for an exact UTC hour."""
+    H = Herbie(dt_str, model="urma", product="anl")
+    ds = H.xarray(":TMP:2 m", remove_grib=True)
+    if isinstance(ds, list): ds = ds[0]
+    var_key = list(ds.data_vars)[0]
+    data_k = ds[var_key].squeeze().values[::2, ::2]
+    lats = ds.latitude.values[::2, ::2]
+    lons = ds.longitude.values[::2, ::2]
+    ds.close()
+    
+    regridded_k = regrid_to_conus(data_k, lats, lons)
+    return (regridded_k - 273.15) * 9/5 + 32
+
+def get_urma_proxies(target_dt):
+    """Computes URMA 12z Min and max(18z, 00z) Max proxies."""
+    date_str = target_dt.strftime('%Y-%m-%d')
+    next_day_str = (target_dt + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
+
+    t_12z = get_urma_tmp(f"{date_str} 12:00")
+    t_18z = get_urma_tmp(f"{date_str} 18:00")
+    t_00z = get_urma_tmp(f"{next_day_str} 00:00")
+
+    urma_min = t_12z
+    urma_max = np.maximum(t_18z, t_00z)
+    return urma_min, urma_max
+
+# ------------------------------------------------------------------------------
+# 4. AIFS Direct Mean Batched Retrieval
 # ------------------------------------------------------------------------------
 def get_aifs_proxies(init_date_str, lead_day):
-    """
-    Downloads Min T (12z) and Max T (18z & 00z) in a SINGLE batched GRIB transfer.
-    """
+    """Batched pull of AIFS 12z, 18z, and 00z steps."""
     dt_clean = init_date_str.replace("-", "")
-    fxx_min = lead_day * 24 - 12
-    fxx_max1 = lead_day * 24 - 6
-    fxx_max2 = lead_day * 24
-    needed_steps = [fxx_min, fxx_max1, fxx_max2]
+    fxx_12z = lead_day * 24 + 12
+    fxx_18z = lead_day * 24 + 18
+    fxx_00z = lead_day * 24 + 24
+    needed_steps = [fxx_12z, fxx_18z, fxx_00z]
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".grib2") as tmp:
         tmp_target = tmp.name
 
     success = False
-    # Cycle sources: Azure usually throttles less than AWS S3 on date prefixes
     for source in ["azure", "aws", "ecmwf"]:
         try:
             client = Client(source=source, model="aifs-ens", resol="0p25")
@@ -87,7 +113,6 @@ def get_aifs_proxies(init_date_str, lead_day):
         if os.path.exists(tmp_target): os.remove(tmp_target)
         raise RuntimeError(f"Could not retrieve AIFS ENS steps {needed_steps} for {dt_clean}")
 
-    # Read the multi-step GRIB
     ds = xr.open_dataset(tmp_target, engine='cfgrib', backend_kwargs={'indexpath': ''})
     var_key = 't2m' if 't2m' in ds else list(ds.data_vars)[0]
     da = ds[var_key]
@@ -97,11 +122,9 @@ def get_aifs_proxies(init_date_str, lead_day):
     da = da.sortby(['latitude', 'longitude'])
     da_interp = da.interp(latitude=grid_lats, longitude=grid_lons, method='linear')
 
-    # Extract grids by step index
-    # (Step 0 = fxx_min, Step 1 = fxx_max1, Step 2 = fxx_max2)
     vals = da_interp.values
     ds.close()
-    for f in glob.glob(f"{tmp_target}*"):
+    for f in glob.glob(f"{tmp_target}*"): 
         try: os.remove(f)
         except Exception: pass
 
@@ -109,20 +132,19 @@ def get_aifs_proxies(init_date_str, lead_day):
         t_min_k = vals[0]
         t_max_k = np.maximum(vals[1], vals[2])
     else:
-        # Fallback if single slice returned
-        t_min_k = vals
-        t_max_k = vals
+        t_min_k, t_max_k = vals, vals
 
     return (t_min_k - 273.15) * 9/5 + 32, (t_max_k - 273.15) * 9/5 + 32
 
 # ------------------------------------------------------------------------------
-# 4. NBM & URMA Helpers
+# 5. NBM Hourly 2m Temperature (Core GRIBs via S3 Byte-Ranges)
 # ------------------------------------------------------------------------------
-def get_nbm_qmd(init_dt, lead_hrs, var_type):
+def get_nbm_hourly_tmp(init_dt, lead_hrs):
+    """Pulls exact hourly 2m TMP from NBM core."""
     date_str = init_dt.strftime('%Y%m%d')
     cycle_str = f"{init_dt.hour:02d}"
-    base_url = f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{date_str}/{cycle_str}/qmd"
-    grib_name = f"blend.t{cycle_str}z.qmd.f{lead_hrs:03d}.co.grib2"
+    base_url = f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{date_str}/{cycle_str}/core"
+    grib_name = f"blend.t{cycle_str}z.core.f{lead_hrs:03d}.co.grib2"
     
     r_idx = requests.get(f"{base_url}/{grib_name}.idx", timeout=20)
     if r_idx.status_code != 200:
@@ -132,18 +154,13 @@ def get_nbm_qmd(init_dt, lead_hrs, var_type):
     lines = r_idx.text.splitlines()
     for i, line in enumerate(lines):
         line_l = line.lower()
-        if "50% level" in line_l and "2 m above ground" in line_l:
-            if var_type == 'max' and "max" in line_l:
-                start_byte = int(line.split(':')[1])
-                if i + 1 < len(lines): end_byte = int(lines[i+1].split(':')[1]) - 1
-                break
-            elif var_type == 'min' and "min" in line_l:
-                start_byte = int(line.split(':')[1])
-                if i + 1 < len(lines): end_byte = int(lines[i+1].split(':')[1]) - 1
-                break
-                
+        if ":tmp:" in line_l and "2 m" in line_l:
+            start_byte = int(line.split(':')[1])
+            if i + 1 < len(lines): end_byte = int(lines[i+1].split(':')[1]) - 1
+            break
+            
     if start_byte is None:
-        raise ValueError(f"Could not locate 50% {var_type} in {grib_name}.idx")
+        raise ValueError(f"Could not locate 2m TMP in {grib_name}.idx")
         
     headers = {"Range": f"bytes={start_byte}-{end_byte}" if end_byte else f"bytes={start_byte}-"}
     r = requests.get(f"{base_url}/{grib_name}", headers=headers, timeout=30)
@@ -165,21 +182,22 @@ def get_nbm_qmd(init_dt, lead_hrs, var_type):
     data_k = regrid_to_conus(data[::2, ::2], lats[::2, ::2], lons[::2, ::2])
     return (data_k - 273.15) * 9/5 + 32
 
-def get_urma(valid_date_str):
-    H_max = Herbie(f"{valid_date_str} 08:00", model="urma", product="anl")
-    ds_max = H_max.xarray(":TMAX:2 m above ground:", remove_grib=True)
-    t_max_data = ds_max[list(ds_max.data_vars)[0]].squeeze().values[::2, ::2]
-    t_max = regrid_to_conus(t_max_data, ds_max.latitude.values[::2, ::2], ds_max.longitude.values[::2, ::2])
+def get_nbm_proxies(init_dt, lead_day):
+    """Pulls matching NBM 12z, 18z, and 00z temperatures."""
+    fxx_12z = lead_day * 24 + 6
+    fxx_18z = lead_day * 24 + 12
+    fxx_00z = lead_day * 24 + 18
 
-    H_min = Herbie(f"{valid_date_str} 20:00", model="urma", product="anl")
-    ds_min = H_min.xarray(":TMIN:2 m above ground:", remove_grib=True)
-    t_min_data = ds_min[list(ds_min.data_vars)[0]].squeeze().values[::2, ::2]
-    t_min = regrid_to_conus(t_min_data, ds_min.latitude.values[::2, ::2], ds_min.longitude.values[::2, ::2])
+    t_12z = get_nbm_hourly_tmp(init_dt, fxx_12z)
+    t_18z = get_nbm_hourly_tmp(init_dt, fxx_18z)
+    t_00z = get_nbm_hourly_tmp(init_dt, fxx_00z)
 
-    return (t_min - 273.15) * 9/5 + 32, (t_max - 273.15) * 9/5 + 32
+    nbm_min = t_12z
+    nbm_max = np.maximum(t_18z, t_00z)
+    return nbm_min, nbm_max
 
 # ------------------------------------------------------------------------------
-# 5. Main Processing Loop
+# 6. Daily Processing Execution
 # ------------------------------------------------------------------------------
 def process_date(target_dt):
     date_str = target_dt.strftime('%Y-%m-%d')
@@ -190,7 +208,8 @@ def process_date(target_dt):
 
     print(f"\n--- Processing Valid Date: {date_str} ---")
     try:
-        urma_min_f, urma_max_f = get_urma(date_str)
+        urma_min_f, urma_max_f = get_urma_proxies(target_dt)
+        print("  -> URMA 12z, 18z, 00z hourly analyses processed.")
     except Exception as e:
         print(f"  [!] URMA unavailable for {date_str}: {e}. Skipping date.")
         return
@@ -201,27 +220,25 @@ def process_date(target_dt):
         init_date_str = init_date.strftime('%Y-%m-%d')
         init_06z = pd.to_datetime(f"{init_date_str} 06:00")
         
-        # AIFS Batched Proxy
+        # AIFS Proxies
         try:
             aifs_min, aifs_max = get_aifs_proxies(init_date_str, lead)
             daily_diffs[f'aifs_lead_{lead}_maxt_diff'] = (['lat', 'lon'], (aifs_max - urma_max_f).astype(np.float32))
             daily_diffs[f'aifs_lead_{lead}_mint_diff'] = (['lat', 'lon'], (aifs_min - urma_min_f).astype(np.float32))
-            print(f"  -> Day {lead} AIFS (Batched) processed.")
+            print(f"  -> Day {lead} AIFS (12z & max(18z,00z)) processed.")
         except Exception as e:
             print(f"  [!] AIFS Day {lead} failed: {e}")
             daily_diffs[f'aifs_lead_{lead}_maxt_diff'] = (['lat', 'lon'], np.full(TARGET_LATS.shape, np.nan, dtype=np.float32))
             daily_diffs[f'aifs_lead_{lead}_mint_diff'] = (['lat', 'lon'], np.full(TARGET_LATS.shape, np.nan, dtype=np.float32))
 
-        # Polite 1.5s delay to keep AWS/Azure rate limiters happy
-        time.sleep(1.5)
+        time.sleep(1.2)
 
-        # NBM QMD Median
+        # NBM Proxies
         try:
-            nbm_max = get_nbm_qmd(init_06z, lead * 24, 'max')
-            nbm_min = get_nbm_qmd(init_06z, lead * 24 + 12, 'min')
+            nbm_min, nbm_max = get_nbm_proxies(init_06z, lead)
             daily_diffs[f'nbm_lead_{lead}_maxt_diff'] = (['lat', 'lon'], (nbm_max - urma_max_f).astype(np.float32))
             daily_diffs[f'nbm_lead_{lead}_mint_diff'] = (['lat', 'lon'], (nbm_min - urma_min_f).astype(np.float32))
-            print(f"  -> Day {lead} NBM processed.")
+            print(f"  -> Day {lead} NBM (12z & max(18z,00z)) processed.")
         except Exception as e:
             print(f"  [!] NBM Day {lead} failed: {e}")
             daily_diffs[f'nbm_lead_{lead}_maxt_diff'] = (['lat', 'lon'], np.full(TARGET_LATS.shape, np.nan, dtype=np.float32))
@@ -239,6 +256,7 @@ if __name__ == '__main__':
     parser.add_argument("--backfill", type=int, default=1, help="Number of historical days to process")
     args = parser.parse_args()
 
+    # Yesterday is the most recently completed full diurnal cycle
     base_target = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
     for d in range(args.backfill):
         process_date(base_target - pd.Timedelta(days=d))
