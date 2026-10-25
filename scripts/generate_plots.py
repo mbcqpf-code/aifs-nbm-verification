@@ -21,7 +21,7 @@ if not files:
     raise FileNotFoundError("No cache files found in data_cache/")
 
 # ------------------------------------------------------------------------------
-# 1. Spatial Bias & MAE Plotter
+# 1. Spatial Bias & MAE Maps (Side-by-Side Comparison)
 # ------------------------------------------------------------------------------
 def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_label, mode_label, metric, out_name):
     if metric == 'bias':
@@ -60,7 +60,7 @@ def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, v
     plt.close()
 
 # ------------------------------------------------------------------------------
-# 2. Win Rate Plotter (% Days AIFS Error < NBM Error)
+# 2. Win Rate Map (% Days AIFS Error < NBM Error)
 # ------------------------------------------------------------------------------
 def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_label, mode_label, out_name):
     aifs_abs = np.abs(diff_stack_aifs)
@@ -81,15 +81,12 @@ def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_labe
     ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=0.7)
     ax.add_feature(cfeature.STATES.with_scale('50m'), linewidth=0.4, edgecolor='gray')
 
-    levels = np.arange(0, 105, 5)
-    im = ax.contourf(
+    im = ax.pcolormesh(
         lons, lats, win_rate, 
-        levels=levels, 
         cmap='RdBu', 
         vmin=0, 
         vmax=100, 
-        transform=ccrs.PlateCarree(),
-        extend='neither'
+        transform=ccrs.PlateCarree()
     )
 
     ax.set_title(
@@ -106,7 +103,7 @@ def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_labe
     plt.close()
 
 # ------------------------------------------------------------------------------
-# 3. Average Diurnal Correction Map (The NBM Transfer Grid)
+# 3. Average Diurnal Correction Map
 # ------------------------------------------------------------------------------
 def plot_delta_map(delta_stack, lats, lons, lead, var, out_name):
     avg_delta = np.nanmean(delta_stack, axis=0)
@@ -211,7 +208,6 @@ with xr.open_dataset(files[0]) as ref:
 
 for lead in range(1, 9):
     for var, var_label in [('maxt', 'Max T'), ('mint', 'Min T')]:
-        # Generate for both modes
         for mode, mode_label in [('proxy', 'Hourly Proxy'), ('corr', 'Corrected Extreme')]:
             a_diffs = []
             n_diffs = []
@@ -227,16 +223,13 @@ for lead in range(1, 9):
                     continue
 
             if a_diffs and n_diffs:
-                # Bias & MAE
                 for metric in ['bias', 'mae']:
                     out_name = f"day{lead}_{var}_{mode}_{metric}.png"
                     plot_spatial_comparison(a_diffs, n_diffs, lats, lons, lead, var_label, mode_label, metric, out_name)
 
-                # Win Rate
                 winrate_name = f"day{lead}_{var}_{mode}_winrate.png"
                 plot_winrate_map(np.array(a_diffs), np.array(n_diffs), lats, lons, lead, var_label, mode_label, winrate_name)
 
-        # Generate Diurnal Delta Map
         delta_stack = []
         for f in window_files:
             try:
