@@ -14,12 +14,18 @@ from ecmwf.opendata import Client
 import warnings
 warnings.filterwarnings('ignore')
 
+# ------------------------------------------------------------------------------
+# 1. Override multiurl 120s Sleep Penalty
+# ------------------------------------------------------------------------------
 try:
     import multiurl.http
     multiurl.http.ROBUST_DEFAULTS = {"maximum_tries": 5, "retry_after": 5}
 except Exception:
     pass
 
+# ------------------------------------------------------------------------------
+# 2. Target 0.25° CONUS Grid Setup
+# ------------------------------------------------------------------------------
 LAT_MIN, LAT_MAX = 24.0, 50.0
 LON_MIN, LON_MAX = -125.0, -65.0
 grid_lats = np.arange(LAT_MIN, LAT_MAX + 0.25, 0.25)
@@ -30,6 +36,7 @@ CACHE_DIR = "data_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 def regrid_to_conus(data, lats, lons):
+    """Interpolates curvilinear/irregular grids to target 0.25 deg CONUS mesh."""
     if lons.max() > 180:
         lons = np.where(lons > 180, lons - 360, lons)
     mask = (lats >= LAT_MIN - 2) & (lats <= LAT_MAX + 2) & (lons >= LON_MIN - 2) & (lons <= LON_MAX + 2)
@@ -41,9 +48,10 @@ def regrid_to_conus(data, lats, lons):
     )
 
 # ------------------------------------------------------------------------------
-# 1. URMA Ingestion (Hourly Proxies & True Extremes)
+# 3. URMA Ingestion (Hourly Proxies & True Daily Extremes)
 # ------------------------------------------------------------------------------
 def get_urma_tmp(dt_str):
+    """Pulls URMA instantaneous 2m temperature analysis for an exact UTC hour."""
     H = Herbie(dt_str, model="urma", product="anl")
     ds = H.xarray(":TMP:2 m", remove_grib=True)
     if isinstance(ds, list): ds = ds[0]
@@ -55,17 +63,18 @@ def get_urma_tmp(dt_str):
     return (regrid_to_conus(data_k, lats, lons) - 273.15) * 9/5 + 32
 
 def get_urma_all(target_dt):
+    """Retrieves both hourly proxies and official 24-hr daily extremes from URMA."""
     date_str = target_dt.strftime('%Y-%m-%d')
     next_day_str = (target_dt + pd.Timedelta(days=1)).strftime('%Y-%m-%d')
 
-    # Instantaneous hourly proxies
+    # Instantaneous synoptic proxies
     t_12z = get_urma_tmp(f"{date_str} 12:00")
     t_18z = get_urma_tmp(f"{date_str} 18:00")
     t_00z = get_urma_tmp(f"{next_day_str} 00:00")
     proxy_min = t_12z
     proxy_max = np.maximum(t_18z, t_00z)
 
-    # True daily extremes
+    # True 24-hour daily extremes
     H_max = Herbie(f"{next_day_str} 08:00", model="urma", product="anl")
     ds_max = H_max.xarray(":TMAX:2 m above ground:", remove_grib=True)
     t_max_data = ds_max[list(ds_max.data_vars)[0]].squeeze().values[::2, ::2]
@@ -79,9 +88,10 @@ def get_urma_all(target_dt):
     return proxy_min, proxy_max, true_min, true_max
 
 # ------------------------------------------------------------------------------
-# 2. AIFS Direct Mean Retrieval
+# 4. AIFS Direct Mean Retrieval (type="em")
 # ------------------------------------------------------------------------------
 def get_aifs_hourly(init_date_str, lead_day):
+    """Downloads AIFS 12z, 18z, and 00z in a single batched GRIB retrieval."""
     dt_clean = init_date_str.replace("-", "")
     fxx_12z = lead_day * 24 + 12
     fxx_18z = lead_day * 24 + 18
@@ -139,9 +149,10 @@ def get_aifs_hourly(init_date_str, lead_day):
     return t_12z, t_18z, t_00z
 
 # ------------------------------------------------------------------------------
-# 3. NBM 06z QMD Retrieval (Hourly 50% TMP & True 50% Max/Min)
+# 5. NBM 06z QMD Retrieval (Hourly 50% TMP & True 50% Max/Min)
 # ------------------------------------------------------------------------------
 def get_nbm_qmd_grid(init_dt, lead_hrs, var_type):
+    """Pulls targeted NBM QMD 50th percentile (Median) grids via AWS byte-ranges."""
     date_str = init_dt.strftime('%Y%m%d')
     cycle_str = f"{init_dt.hour:02d}"
     base_url = f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.{date_str}/{cycle_str}/qmd"
@@ -193,23 +204,28 @@ def get_nbm_qmd_grid(init_dt, lead_hrs, var_type):
     return (data_k - 273.15) * 9/5 + 32
 
 def get_nbm_all(init_dt, lead_day):
-    fxx_12z = lead_day * 24 + 6
-    fxx_18z = lead_day * 24 + 12
-    fxx_00z = lead_day * 24 + 18
+    """
+    Pulls hourly synoptic steps (12z, 18z, 00z) and true daily extreme
+    steps (mint in f036/060/..., maxt in f048/072/...) from NBM 06z QMD.
+    """
+    fxx_12z = lead_day * 24 + 6   # Day 1 = f030
+    fxx_18z = lead_day * 24 + 12  # Day 1 = f036
+    fxx_00z = lead_day * 24 + 18  # Day 1 = f042
 
-    # Hourly synoptic temperatures
+    fxx_mint = lead_day * 24 + 12 # Day 1 = f036
+    fxx_maxt = lead_day * 24 + 24 # Day 1 = f048
+
     t_12z = get_nbm_qmd_grid(init_dt, fxx_12z, 'tmp')
     t_18z = get_nbm_qmd_grid(init_dt, fxx_18z, 'tmp')
     t_00z = get_nbm_qmd_grid(init_dt, fxx_00z, 'tmp')
 
-    # True daily extremes (from QMD distribution)
-    true_min = get_nbm_qmd_grid(init_dt, fxx_12z, 'mint')
-    true_max = get_nbm_qmd_grid(init_dt, fxx_00z, 'maxt')
+    true_min = get_nbm_qmd_grid(init_dt, fxx_mint, 'mint')
+    true_max = get_nbm_qmd_grid(init_dt, fxx_maxt, 'maxt')
 
     return t_12z, t_18z, t_00z, true_min, true_max
 
 # ------------------------------------------------------------------------------
-# 4. Pipeline Execution
+# 6. Execution Pipeline
 # ------------------------------------------------------------------------------
 def process_date(target_dt, overwrite=False):
     date_str = target_dt.strftime('%Y-%m-%d')
@@ -269,17 +285,15 @@ def process_date(target_dt, overwrite=False):
 
         # 4. Mode 2: Diurnal Corrections & True Extreme Differences
         if nbm_pmin is not None and nbm_tmin is not None:
-            delta_max = np.clip(nbm_tmax - nbm_pmax, 0, None) # Diurnal boost >= 0
-            delta_min = np.clip(nbm_tmin - nbm_pmin, None, 0) # Nighttime cooling <= 0
+            delta_max = np.clip(nbm_tmax - nbm_pmax, 0, None)
+            delta_min = np.clip(nbm_tmin - nbm_pmin, None, 0)
 
             daily_diffs[f'lead_{lead}_maxt_delta'] = (['lat', 'lon'], delta_max.astype(np.float32))
             daily_diffs[f'lead_{lead}_mint_delta'] = (['lat', 'lon'], np.abs(delta_min).astype(np.float32))
 
-            # NBM true error
             daily_diffs[f'nbm_lead_{lead}_maxt_corr_diff'] = (['lat', 'lon'], (nbm_tmax - urma_tmax).astype(np.float32))
             daily_diffs[f'nbm_lead_{lead}_mint_corr_diff'] = (['lat', 'lon'], (nbm_tmin - urma_tmin).astype(np.float32))
 
-            # AIFS diurnally corrected error
             if aifs_pmin is not None:
                 aifs_corr_max = aifs_pmax + delta_max
                 aifs_corr_min = aifs_pmin + delta_min
@@ -308,7 +322,7 @@ def process_date(target_dt, overwrite=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--backfill", type=int, default=1, help="Number of historical days")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing cache files")
+    parser.add_argument("--overwrite", action="store_true", help="Force overwrite existing cache files")
     args = parser.parse_args()
 
     base_target = pd.Timestamp.utcnow().floor('D') - pd.Timedelta(days=1)
