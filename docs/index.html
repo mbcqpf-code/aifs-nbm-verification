@@ -3,31 +3,39 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AIFS vs NBM Verification Dashboard</title>
+    <title>AIFS vs NBM Temperature Verification</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
         .map-img { width: 100%; max-width: 1050px; height: auto; border-radius: 6px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .mode-btn.active { font-weight: bold; }
     </style>
 </head>
 <body class="bg-light">
 <div class="container py-4">
     <header class="pb-3 mb-4 border-bottom text-center">
         <h1 class="fw-bold">AIFS vs. NBM Medium-Range Verification</h1>
-        <p class="text-muted">Apples-to-Apples Synoptic Hourly Evaluation vs. NOAA URMA Analysis</p>
+        <p class="text-muted">Dual-Method Evaluation: Synoptic Hourly Proxies vs. Diurnally Corrected Extremes</p>
     </header>
 
-    <!-- Methodology Notes -->
-    <div class="alert alert-info" role="alert">
-        <h5 class="alert-heading fw-bold">ℹ️ Verification Methodology:</h5>
-        <ul class="mb-1">
-            <li><strong>Synchronized Sampling:</strong> To prevent artificial diurnal penalties from 6-hourly output, <strong>Min T is evaluated at 12:00 UTC</strong> and <strong>Max T is evaluated as $\max(18\text{z}, 00\text{z})$</strong> identically across AIFS, NBM, and URMA.</li>
-            <li><strong>Datasets:</strong> 00z AIFS Ensemble Mean vs. 06z NBM Core (13z operational package) interpolated to a shared 0.25° CONUS mesh.</li>
-            <li><strong>Win Rate Interpretation:</strong> Displays the percentage of days AIFS achieved a lower absolute error than NBM. Blue shading indicates AIFS superiority (>50%), while Red indicates NBM superiority (<50%).</li>
-        </ul>
+    <!-- Mode Selector Navigation -->
+    <div class="d-flex justify-content-center mb-4">
+        <div class="btn-group p-1 bg-white rounded shadow-sm border" role="group">
+            <button type="button" id="btnModeCorr" class="btn btn-primary px-4 py-2 mode-btn active" onclick="switchMode('corr')">
+                ☀️ Mode 1: Diurnally Corrected Daily Extremes
+            </button>
+            <button type="button" id="btnModeProxy" class="btn btn-outline-primary px-4 py-2 mode-btn" onclick="switchMode('proxy')">
+                ⏱️ Mode 2: Direct Synoptic Hourly Proxies
+            </button>
+        </div>
     </div>
 
-    <!-- Controls -->
-    <div class="card p-3 my-4">
+    <!-- Explanatory Banner (Dynamically Updates) -->
+    <div id="methodologyAlert" class="alert alert-info shadow-sm" role="alert">
+        <!-- Content injected by JavaScript -->
+    </div>
+
+    <!-- Interactive Selectors -->
+    <div class="card p-3 my-4 shadow-sm border-0">
         <div class="row g-3 align-items-center justify-content-center">
             <div class="col-auto">
                 <label class="fw-bold">Lead Time:</label>
@@ -45,8 +53,8 @@
             <div class="col-auto">
                 <label class="fw-bold">Variable:</label>
                 <select id="varSelect" class="form-select" onchange="updateView()">
-                    <option value="maxt" selected>Max T Proxy [max(18z, 00z)]</option>
-                    <option value="mint">Min T Proxy [12z]</option>
+                    <option value="maxt" selected>Maximum Temperature</option>
+                    <option value="mint">Minimum Temperature</option>
                 </select>
             </div>
             <div class="col-auto">
@@ -55,61 +63,124 @@
                     <option value="winrate" selected>% Days AIFS Better (Win Rate)</option>
                     <option value="mae">Mean Absolute Error (Side-by-Side)</option>
                     <option value="bias">Mean Bias (Side-by-Side)</option>
+                    <option value="delta">Average NBM Diurnal Correction Grid Applied (°F)</option>
                 </select>
             </div>
         </div>
     </div>
 
-    <!-- Map Display -->
+    <!-- Map Container -->
     <div class="text-center mb-5">
-        <img id="displayMap" class="map-img border" src="assets/maps/day3_maxt_winrate.png" alt="Verification Map">
+        <img id="displayMap" class="map-img border" src="" alt="Verification Map">
     </div>
 
-    <!-- Error Trends (CONUS & East of Rockies) -->
-    <div class="card p-4">
+    <!-- Regional Error Trend Line Charts -->
+    <div class="card p-4 shadow-sm border-0">
         <h4 class="fw-bold border-bottom pb-2">Error Growth by Forecast Lead (Days 1–8)</h4>
         
-        <!-- Row 1: Full CONUS -->
+        <!-- CONUS Section -->
         <h5 class="fw-bold mt-3 text-secondary">Full CONUS Domain</h5>
         <div class="row g-3">
             <div class="col-md-6 text-center">
-                <h6>Max T Proxy [max(18z, 00z)] MAE</h6>
-                <img class="img-fluid border rounded" src="assets/charts/regional_mae_conus_maxt.png" alt="CONUS Max T MAE">
+                <h6 id="conusChartTitleMax">Max T MAE vs. URMA</h6>
+                <img id="chartConusMax" class="img-fluid border rounded" src="" alt="CONUS Max T Trend">
             </div>
             <div class="col-md-6 text-center">
-                <h6>Min T Proxy [12z] MAE</h6>
-                <img class="img-fluid border rounded" src="assets/charts/regional_mae_conus_mint.png" alt="CONUS Min T MAE">
+                <h6 id="conusChartTitleMin">Min T MAE vs. URMA</h6>
+                <img id="chartConusMin" class="img-fluid border rounded" src="" alt="CONUS Min T Trend">
             </div>
         </div>
 
         <hr class="my-4">
 
-        <!-- Row 2: East of the Rockies -->
+        <!-- East of Rockies Section -->
         <div class="d-flex justify-content-between align-items-center">
             <h5 class="fw-bold text-secondary mb-0">East of the Rockies (Longitude ≥ -105°W)</h5>
-            <span class="badge bg-secondary">Terrain-Filtered Synoptic Zone</span>
+            <span class="badge bg-secondary">Synoptic Advection Zone</span>
         </div>
         <p class="text-muted small mt-1">Excludes complex Intermountain West terrain where high-resolution statistical downscaling strongly aids NBM.</p>
         <div class="row g-3">
             <div class="col-md-6 text-center">
-                <h6>Max T Proxy [max(18z, 00z)] MAE</h6>
-                <img class="img-fluid border rounded" src="assets/charts/regional_mae_east_rockies_maxt.png" alt="East of Rockies Max T MAE">
+                <h6 id="rockiesChartTitleMax">Max T MAE vs. URMA</h6>
+                <img id="chartRockiesMax" class="img-fluid border rounded" src="" alt="East of Rockies Max T Trend">
             </div>
             <div class="col-md-6 text-center">
-                <h6>Min T Proxy [12z] MAE</h6>
-                <img class="img-fluid border rounded" src="assets/charts/regional_mae_east_rockies_mint.png" alt="East of Rockies Min T MAE">
+                <h6 id="rockiesChartTitleMin">Min T MAE vs. URMA</h6>
+                <img id="chartRockiesMin" class="img-fluid border rounded" src="" alt="East of Rockies Min T Trend">
             </div>
         </div>
     </div>
 </div>
 
 <script>
+let currentMode = 'corr'; // Default to Diurnally Corrected Extremes
+
+const infoTexts = {
+    'corr': `
+        <h5 class="alert-heading fw-bold mb-1">☀️ Diurnally Corrected Daily Extremes:</h5>
+        <p class="mb-1">Because AIFS only produces 6-hourly output, the daytime heating peak and nocturnal radiational cooling are missed. This mode calculates the high-resolution empirical diurnal offset from the NBM and transfers it to the AIFS:</p>
+        <ul class="mb-0">
+            <li><strong>Max T Correction:</strong> $\\Delta_{\\text{max}} = \\max(\\text{NBM True MaxT} - \\max(\\text{NBM}_{18\\text{z}}, \\text{NBM}_{00\\text{z}}), 0)$. Corrected AIFS MaxT = $\\max(\\text{AIFS}_{18\\text{z}}, \\text{AIFS}_{00\\text{z}}) + \\Delta_{\\text{max}}$.</li>
+            <li><strong>Min T Correction:</strong> $\\Delta_{\\text{min}} = \\min(\\text{NBM True MinT} - \\text{NBM}_{12\\text{z}}, 0)$. Corrected AIFS MinT = $\\text{AIFS}_{12\\text{z}} + \\Delta_{\\text{min}}$.</li>
+            <li><strong>Verification Truth:</strong> Both models are verified against true 24-hour NOAA URMA daily extremes (<code>:TMAX:</code> and <code>:TMIN:</code>).</li>
+        </ul>
+    `,
+    'proxy': `
+        <h5 class="alert-heading fw-bold mb-1">⏱️ Direct Synoptic Hourly Proxies:</h5>
+        <p class="mb-1">Pure algorithmic comparison without post-processing or empirical diurnal shifts. <strong>AIFS, NBM, and URMA are sampled at the exact same hourly timestamps:</strong></p>
+        <ul class="mb-0">
+            <li><strong>Min T Proxy:</strong> Instantaneous 2m Temperature evaluated at <strong>12:00 UTC</strong> across AIFS, NBM, and URMA.</li>
+            <li><strong>Max T Proxy:</strong> Instantaneous 2m Temperature evaluated as <strong>$\\max(18\\text{z}, 00\\text{z})$</strong> across AIFS, NBM, and URMA.</li>
+            <li><strong>Verification Truth:</strong> Verifying baseline is the instantaneous NOAA URMA 2m analysis at those exact UTC hours.</li>
+        </ul>
+    `
+};
+
+function switchMode(mode) {
+    currentMode = mode;
+    const btnCorr = document.getElementById("btnModeCorr");
+    const btnProxy = document.getElementById("btnModeProxy");
+    const deltaOpt = document.querySelector("#metricSelect option[value='delta']");
+
+    if (mode === 'corr') {
+        btnCorr.className = "btn btn-primary px-4 py-2 mode-btn active";
+        btnProxy.className = "btn btn-outline-primary px-4 py-2 mode-btn";
+        deltaOpt.style.display = "block";
+    } else {
+        btnProxy.className = "btn btn-primary px-4 py-2 mode-btn active";
+        btnCorr.className = "btn btn-outline-primary px-4 py-2 mode-btn";
+        deltaOpt.style.display = "none";
+        if (document.getElementById("metricSelect").value === 'delta') {
+            document.getElementById("metricSelect").value = 'winrate';
+        }
+    }
+
+    document.getElementById("methodologyAlert").innerHTML = infoTexts[mode];
+    updateView();
+}
+
 function updateView() {
     const lead = document.getElementById("leadSelect").value;
     const variable = document.getElementById("varSelect").value;
     const metric = document.getElementById("metricSelect").value;
-    document.getElementById("displayMap").src = `assets/maps/day${lead}_${variable}_${metric}.png`;
+
+    let mapFilename = "";
+    if (metric === 'delta') {
+        mapFilename = `assets/maps/day${lead}_${variable}_delta.png`;
+    } else {
+        mapFilename = `assets/maps/day${lead}_${variable}_${currentMode}_${metric}.png`;
+    }
+    document.getElementById("displayMap").src = mapFilename;
+
+    // Update Regional Trend Line Charts
+    document.getElementById("chartConusMax").src = `assets/charts/regional_mae_conus_maxt_${currentMode}.png`;
+    document.getElementById("chartConusMin").src = `assets/charts/regional_mae_conus_mint_${currentMode}.png`;
+    document.getElementById("chartRockiesMax").src = `assets/charts/regional_mae_east_rockies_maxt_${currentMode}.png`;
+    document.getElementById("chartRockiesMin").src = `assets/charts/regional_mae_east_rockies_mint_${currentMode}.png`;
 }
+
+// Initialize on page load
+switchMode('corr');
 </script>
 </body>
 </html>
