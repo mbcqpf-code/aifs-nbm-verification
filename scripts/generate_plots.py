@@ -7,6 +7,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
+import cartopy.io.shapereader as shpreader
+from shapely.geometry import box
+from shapely.ops import unary_union
+import shapely
 import warnings
 
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -21,9 +25,43 @@ if not files:
     raise FileNotFoundError("No cache files found in data_cache/")
 
 # ------------------------------------------------------------------------------
-# 1. Spatial Bias & MAE Maps (Side-by-Side Comparison)
+# 1. High-Resolution CONUS Land Mask Generator
 # ------------------------------------------------------------------------------
-def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_label, mode_label, metric, out_name):
+def get_conus_land_mask(lats, lons):
+    """
+    Constructs a strict CONUS land mask using Natural Earth state geometries,
+    filtering out oceans, Canada, Mexico, and non-CONUS territories.
+    """
+    mesh_lons, mesh_lats = np.meshgrid(lons, lats)
+    try:
+        shp_path = shpreader.natural_earth(resolution='50m', category='cultural', name='admin_1_states_provinces_lakes')
+        reader = shpreader.Reader(shp_path)
+        us_geoms = [
+            rec.geometry for rec in reader.records()
+            if rec.attributes.get('adm0_a3', rec.attributes.get('ADM0_A3')) == 'USA'
+            and rec.attributes.get('name', '') not in ['Alaska', 'Hawaii', 'Puerto Rico']
+        ]
+        conus_geom = unary_union(us_geoms).intersection(box(-125.0, 24.0, -66.5, 50.0))
+    except Exception:
+        shp_path = shpreader.natural_earth(resolution='110m', category='cultural', name='admin_0_countries')
+        reader = shpreader.Reader(shp_path)
+        us_geom = [rec.geometry for rec in reader.records() if rec.attributes.get('ADM0_A3', rec.attributes.get('adm0_a3')) == 'USA'][0]
+        conus_geom = us_geom.intersection(box(-125.0, 24.0, -66.5, 50.0))
+
+    try:
+        mask = shapely.contains_xy(conus_geom, mesh_lons, mesh_lats)
+    except Exception:
+        from shapely.prepared import prep
+        from shapely.geometry import Point
+        prep_geom = prep(conus_geom)
+        mask = np.array([prep_geom.contains(Point(x, y)) for x, y in zip(mesh_lons.ravel(), mesh_lats.ravel())]).reshape(mesh_lons.shape)
+        
+    return mask
+
+# ------------------------------------------------------------------------------
+# 2. Spatial Bias & MAE Maps (Masked to CONUS Land)
+# ------------------------------------------------------------------------------
+def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, conus_mask, lead, var_label, mode_label, metric, out_name):
     if metric == 'bias':
         grid_aifs = np.nanmean(diff_stack_aifs, axis=0)
         grid_nbm = np.nanmean(diff_stack_nbm, axis=0)
@@ -36,6 +74,10 @@ def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, v
         cmap = 'YlOrRd'
         vmin, vmax = 0, 12
         metric_label = "Mean Absolute Error (°F)"
+
+    # Apply Land Mask (oceans and foreign territories become transparent NaNs)
+    grid_aifs = np.where(conus_mask, grid_aifs, np.nan)
+    grid_nbm = np.where(conus_mask, grid_nbm, np.nan)
 
     fig, axs = plt.subplots(1, 2, figsize=(16, 6), subplot_kw={'projection': ccrs.PlateCarree()})
     
@@ -60,20 +102,20 @@ def plot_spatial_comparison(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, v
     plt.close()
 
 # ------------------------------------------------------------------------------
-# 2. Win Rate Map (% Days AIFS Error < NBM Error)
+# 3. Win Rate Map (% Days AIFS Error < NBM Error, Masked to CONUS Land)
 # ------------------------------------------------------------------------------
-def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_label, mode_label, out_name):
+def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, conus_mask, lead, var_label, mode_label, out_name):
     aifs_abs = np.abs(diff_stack_aifs)
     nbm_abs = np.abs(diff_stack_nbm)
 
-    valid_mask = (~np.isnan(aifs_abs)) & (~np.isnan(nbm_abs))
+    valid_mask = (~np.isnan(aifs_abs)) & (~np.isnan(nbm_abs)) & conus_mask
     aifs_wins = (aifs_abs < nbm_abs) & valid_mask
 
     n_valid = np.sum(valid_mask, axis=0)
     n_wins = np.sum(aifs_wins, axis=0)
 
     with np.errstate(divide='ignore', invalid='ignore'):
-        win_rate = np.where(n_valid > 0, (n_wins / n_valid) * 100.0, np.nan)
+        win_rate = np.where(conus_mask & (n_valid > 0), (n_wins / n_valid) * 100.0, np.nan)
 
     fig = plt.figure(figsize=(11, 7))
     ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
@@ -91,7 +133,7 @@ def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_labe
 
     ax.set_title(
         f"AIFS vs. NBM Win Rate: % Days AIFS Absolute Error < NBM Absolute Error\n"
-        f"Day {lead} {var_label} ({mode_label}) [Sample N={len(diff_stack_aifs)} Days]",
+        f"Day {lead} {var_label} ({mode_label}) [CONUS Land | Sample N={len(diff_stack_aifs)} Days]",
         fontsize=12, weight='bold', pad=10
     )
 
@@ -103,18 +145,19 @@ def plot_winrate_map(diff_stack_aifs, diff_stack_nbm, lats, lons, lead, var_labe
     plt.close()
 
 # ------------------------------------------------------------------------------
-# 3. Average Diurnal Correction Map
+# 4. Average Diurnal Correction Map (Masked to CONUS Land)
 # ------------------------------------------------------------------------------
-def plot_delta_map(delta_stack, lats, lons, lead, var, out_name):
+def plot_delta_map(delta_stack, lats, lons, conus_mask, lead, var, out_name):
     avg_delta = np.nanmean(delta_stack, axis=0)
+    avg_delta = np.where(conus_mask, avg_delta, np.nan)
     
     if var == 'maxt':
-        title = f"Average Daytime Heating Boost Applied to AIFS (Day {lead} Max T)\nNBM [MaxT - max(18z,00z)] [N={len(delta_stack)} Days]"
+        title = f"Average Daytime Heating Boost Applied to AIFS (Day {lead} Max T)\nNBM [MaxT - max(18z,00z)] [CONUS Land | N={len(delta_stack)} Days]"
         cbar_lbl = "Average Diurnal Heating Boost Added (°F)"
         cmap = 'YlOrRd'
         vmin, vmax = 0, 8
     else:
-        title = f"Average Nighttime Radiational Cooling Applied to AIFS (Day {lead} Min T)\nNBM [12z - MinT] [N={len(delta_stack)} Days]"
+        title = f"Average Nighttime Radiational Cooling Applied to AIFS (Day {lead} Min T)\nNBM [12z - MinT] [CONUS Land | N={len(delta_stack)} Days]"
         cbar_lbl = "Average Nocturnal Cooling Subtracted (°F)"
         cmap = 'PuBu'
         vmin, vmax = 0, 8
@@ -135,20 +178,22 @@ def plot_delta_map(delta_stack, lats, lons, lead, var, out_name):
     plt.close()
 
 # ------------------------------------------------------------------------------
-# 4. Regional Summary Line Charts
+# 5. Regional Summary Line Charts (Strict Land Pixel Averaging)
 # ------------------------------------------------------------------------------
-def generate_regional_charts(window_files):
+def generate_regional_charts(window_files, conus_mask):
     leads = list(range(1, 9))
     datasets = [xr.open_dataset(f) for f in window_files]
     
     try:
         sample_ds = datasets[0]
         mesh_lons, _ = np.meshgrid(sample_ds.lon.values, sample_ds.lat.values)
-        east_mask = (mesh_lons >= -105.0)
+        
+        # Combined Land & Geographic Masks
+        east_mask = conus_mask & (mesh_lons >= -105.0)
 
         domains = [
-            ("CONUS", "conus", None),
-            ("East of Rockies (Lon >= -105°W)", "east_rockies", east_mask)
+            ("CONUS Land", "conus", conus_mask),
+            ("East of Rockies Land (Lon >= -105°W)", "east_rockies", east_mask)
         ]
 
         for domain_name, domain_slug, mask in domains:
@@ -167,12 +212,9 @@ def generate_regional_charts(window_files):
                         if a_stack and n_stack:
                             a_arr = np.array(a_stack)
                             n_arr = np.array(n_stack)
-                            if mask is not None:
-                                a_val = np.nanmean(np.abs(a_arr[:, mask]))
-                                n_val = np.nanmean(np.abs(n_arr[:, mask]))
-                            else:
-                                a_val = np.nanmean(np.abs(a_arr))
-                                n_val = np.nanmean(np.abs(n_arr))
+                            # Slice exclusively over land pixels
+                            a_val = np.nanmean(np.abs(a_arr[:, mask]))
+                            n_val = np.nanmean(np.abs(n_arr[:, mask]))
                         else:
                             a_val, n_val = np.nan, np.nan
                         
@@ -199,12 +241,15 @@ def generate_regional_charts(window_files):
             ds.close()
 
 # ------------------------------------------------------------------------------
-# 5. Main Execution
+# 6. Main Execution Loop
 # ------------------------------------------------------------------------------
 window_files = files[:min(14, len(files))]
 with xr.open_dataset(files[0]) as ref:
     lats = ref.lat.values
     lons = ref.lon.values
+
+# Compute CONUS Land Mask once
+conus_mask = get_conus_land_mask(lats, lons)
 
 for lead in range(1, 9):
     for var, var_label in [('maxt', 'Max T'), ('mint', 'Min T')]:
@@ -225,10 +270,10 @@ for lead in range(1, 9):
             if a_diffs and n_diffs:
                 for metric in ['bias', 'mae']:
                     out_name = f"day{lead}_{var}_{mode}_{metric}.png"
-                    plot_spatial_comparison(a_diffs, n_diffs, lats, lons, lead, var_label, mode_label, metric, out_name)
+                    plot_spatial_comparison(a_diffs, n_diffs, lats, lons, conus_mask, lead, var_label, mode_label, metric, out_name)
 
                 winrate_name = f"day{lead}_{var}_{mode}_winrate.png"
-                plot_winrate_map(np.array(a_diffs), np.array(n_diffs), lats, lons, lead, var_label, mode_label, winrate_name)
+                plot_winrate_map(np.array(a_diffs), np.array(n_diffs), lats, lons, conus_mask, lead, var_label, mode_label, winrate_name)
 
         delta_stack = []
         for f in window_files:
@@ -240,7 +285,7 @@ for lead in range(1, 9):
             except Exception:
                 continue
         if delta_stack:
-            plot_delta_map(delta_stack, lats, lons, lead, var, f"day{lead}_{var}_delta.png")
+            plot_delta_map(delta_stack, lats, lons, conus_mask, lead, var, f"day{lead}_{var}_delta.png")
 
-generate_regional_charts(window_files)
-print("All dual-mode verification maps and charts successfully generated.")
+generate_regional_charts(window_files, conus_mask)
+print("All masked graphics and land-only statistics successfully generated.")
